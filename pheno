@@ -1,0 +1,255 @@
+# cognitive_modules.py (modified, includes the PersistentMemory use case)
+import math
+import time
+from collections import defaultdict, deque
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from cognitive_modules_persistent import SQLiteSymbolicMemory
+
+###############################################################################
+# 1) DynamicThresholdCalibration
+#
+# - Keeps adaptive thresholds for numeric "resonance" and categorical "polarity"
+# - Accepts performance feedback signals (e.g., reward, error)
+# - Supports per-key thresholds and global fallback
+###############################################################################
+
+class DynamicThresholdCalibration:
+    """
+Adaptive threshold manager.
+- resonance thresholds are floats (how strong a signal must be).
+- polarity thresholds are dicts mapping labels to acceptance scores.
+"""
+
+    def __init__(
+        self,
+        initial_resonance: float = 0.5,
+        initial_polarity: Optional[Dict[str, float]] = None,
+        momentum: float = 0.9,
+        min_resonance: float = 1e-4,
+        max_resonance: float = 1.0,
+    ):
+        self.momentum = float(momentum)
+        self.min_resonance = float(min_resonance)
+        self.max_resonance = float(max_resonance)
+        self.global_resonance = float(initial_resonance)
+        self.resonance_per_key: Dict[str, float] = {}
+
+        self.global_polarity = dict(initial_polarity or {})
+        self.polarity_per_key: Dict[str, Dict[str, float]] = {}
+
+    def get_resonance(self, key: Optional[str] = None) -> float:
+        if key and key in self.resonance_per_key:
+            return self.resonance_per_key[key]
+        return self.global_resonance
+
+    def get_polarity_threshold(self, label: str, key: Optional[str] = None) -> float:
+        if key and key in self.polarity_per_key and label in self.polarity_per_key[key]:
+            return self.polarity_per_key[key][label]
+        return self.global_polarity.get(label, 0.5)
+
+    def update_from_feedback(
+        self,
+        success: bool,
+        strength: float,
+        label: Optional[str] = None,
+        key: Optional[str] = None,
+        reward: Optional[float] = None,
+    ):
+        """
+Update thresholds based on feedback.
+- If success: relax threshold slightly (make detection easier).
+- If failure: increase threshold if false positive, or decrease if false negative.
+- strength: observed signal strength that triggered decision
+- reward: optional scalar to scale update (+ve better, -ve worse)
+"""
+        r = float(reward) if reward is not None else (1.0 if success else -1.0)
+        sign = 1.0 if success else -1.0
+
+        # Resonance update: EMA towards observed strength scaled by feedback
+        target = max(self.min_resonance, min(self.max_resonance, strength))
+        alpha = 1.0 - self.momentum
+        if key:
+            current = self.resonance_per_key.get(key, self.global_resonance)
+            new = (1 - alpha) * current + alpha * target * (1.0 - 0.5 * sign * (-r + 1))
+            new = max(self.min_resonance, min(self.max_resonance, new))
+            self.resonance_per_key[key] = new
+        else:
+            current = self.global_resonance
+            new = (1 - alpha) * current + alpha * target * (1.0 - 0.5 * sign * (-r + 1))
+            self.global_resonance = max(self.min_resonance, min(self.max_resonance, new))
+
+        # Polarity update if label present: adjust acceptance probability
+        if label:
+            if key:
+                polmap = self.polarity_per_key.setdefault(key, dict(self.global_polarity))
+            else:
+                polmap = self.global_polarity
+            current_p = polmap.get(label, 0.5)
+            # Move polarity toward 1.0 on success, 0.0 on failure, scaled by |reward|
+            adjust = (0.2 * (r if r >= 0 else r)) * (1.0 if success else -1.0)
+            new_p = current_p + (1 - self.momentum) * adjust
+            polmap[label] = max(0.0, min(1.0, new_p))
+
+###############################################################################
+# 2) RecursiveCognitiveLayers
+#
+# - A small framework to stack/process symbolic nodes recursively
+# - Each layer is a callable that takes input symbols and returns output symbols
+# - Supports gating, depth limit, and early-exit by confidence
+###############################################################################
+
+class ProcessingLayer:
+    """
+A single processing layer abstraction around a callable.
+The callable: fn(inputs: List[Any], context: dict) -> List[Tuple[symbol, confidence]]
+"""
+
+    def __init__(self, fn: Callable[[List[Any], Dict[str, Any]], List[Tuple[Any, float]]], name: str = None):
+        self.fn = fn
+        self.name = name or fn.__name__
+
+    def process(self, inputs: List[Any], context: Dict[str, Any]) -> List[Tuple[Any, float]]:
+        return self.fn(inputs, context)
+
+class RecursiveCognitiveLayers:
+    """
+Manage and run a stack/graph of layers recursively/hierarchically.
+- layers: ordered list applied per depth
+- max_depth: prevents runaway recursion
+- early_exit_confidence: if output confidence exceeds threshold, stop
+"""
+
+    def __init__(self, layers: Optional[List[ProcessingLayer]] = None, max_depth: int = 8, early_exit_confidence: float = 0.95):
+        self.layers = layers or []
+        self.max_depth = max_depth
+        self.early_exit_confidence = early_exit_confidence
+
+    def add_layer(self, layer: ProcessingLayer, position: Optional[int] = None):
+        if position is None:
+            self.layers.append(layer)
+        else:
+            self.layers.insert(position, layer)
+
+    def run(self, inputs: List[Any], context: Optional[Dict[str, Any]] = None) -> List[Tuple[Any, float]]:
+        context = context or {}
+        def _recurse(current_inputs: List[Any], depth: int) -> List[Tuple[Any, float]]:
+            if depth >= self.max_depth or not current_inputs:
+                return []
+            results: List[Tuple[Any, float]] = []
+            for layer in self.layers:
+                out = layer.process(current_inputs, context)  # list of (symbol, confidence)
+                if not out:
+                    continue
+                # Collect and decide whether to pass recursively
+                for sym, conf in out:
+                    results.append((sym, conf))
+                # If any result has high confidence, early exit
+                if any(conf >= self.early_exit_confidence for (_, conf) in out):
+                    return results
+            # Prepare next inputs: symbols (ignoring confidences)
+            next_inputs = [s for (s, _) in results]
+            # Avoid infinite loops: deduplicate while preserving order
+            seen = set()
+            filtered = []
+            for s in next_inputs:
+                if s not in seen:
+                    filtered.append(s)
+                    seen.add(s)
+            deeper = _recurse(filtered, depth + 1)
+            # Merge results, prefer higher confidence for same symbol
+            merged: Dict[Any, float] = {}
+            for s, c in results + deeper:
+                merged[s] = max(merged.get(s, 0.0), c)
+            return sorted(merged.items(), key=lambda x: -x[1])
+        return _recurse(inputs, 0)
+
+###############################################################################
+# 4) SymbolicConsciousnessEngine (Integration)
+#
+# - Minimal engine to show how memory, calibration, and layers can be wired
+# - Accepts input symbols, queries memory, runs processing stack, updates calibration
+###############################################################################
+
+
+class SymbolicConsciousnessEngine:
+    def __init__(
+        self,
+        memory: Optional[SQLiteSymbolicMemory] = None,  # Changed to SQLiteSymbolicMemory
+        calibrator: Optional[DynamicThresholdCalibration] = None,
+        processor: Optional[RecursiveCognitiveLayers] = None,
+    ):
+        self.memory = memory or SQLiteSymbolicMemory()  # Changed to SQLiteSymbolicMemory
+        self.calibrator = calibrator or DynamicThresholdCalibration()
+        self.processor = processor or RecursiveCognitiveLayers()
+        # a simple history for debugging/training feedback
+        self.history: deque = deque(maxlen=1000)
+
+    def perceive(self, inputs: List[Any], context: Optional[Dict[str, Any]] = None) -> List[Tuple[Any, float]]:
+        """
+1. Query memory for immediate associations
+2. Score inputs against resonance thresholds
+3. Run recursive processing
+4. Record and return results
+"""
+        context = context or {}
+        now = time.time()
+
+        # 1) Memory associations
+        assoc_results = []
+        for inp in inputs:
+            assoc = self.memory.get_associations(inp, top_k=5)
+            for sym, w in assoc:
+                # weight combined with memory item strength and recency
+                item = self.memory.retrieve(sym)
+                item_strength = item.strength if item else 1.0
+                score = float(w) * float(item_strength)
+                assoc_results.append((sym, score))
+
+        # 2) apply resonance threshold filtering
+        filtered = []
+        for sym, score in assoc_results:
+            thr = self.calibrator.get_resonance(key=str(sym))
+            if score >= thr:
+                filtered.append((sym, min(1.0, score)))
+            else:
+                # Could still be kept as low-confidence candidate
+                filtered.append((sym, float(score * 0.5)))
+
+        # 3) feed into recursive processor (we only pass symbols)
+        candidates = [s for (s, _) in filtered]
+        processed = self.processor.run(candidates, context)
+
+        # 4) combine confidences: prefer processor confidences, fallback to assoc score
+        combined: Dict[Any, float] = {}
+        assoc_map = {s: sc for s, sc in filtered}
+        for s, conf in processed:
+            combined[s] = max(combined.get(s, 0.0), conf) # Corrected merge logic
+        for s, sc in filtered:
+            combined.setdefault(s, sc)
+
+        results = sorted(combined.items(), key=lambda x: -x[1])
+
+        # record history for training/calibration
+        self.history.append({
+            "time": now,
+            "inputs": inputs,
+            "results": results,
+            "context": context
+        })
+        return results
+
+    def provide_feedback(self, observed: Any, expected: Any, reward: float = 1.0):
+        """
+Example feedback routine to update calibration and memory.
+- observed: the symbol returned by engine
+- expected: ground truth symbol ( or None)
+"""
+        success = (observed == expected)
+        strength = 1.0
+        # update calibrator
+        self.calibrator.update_from_feedback(success=success, strength=strength, label=str(observed))
+        # strengthen memory links for correct associations
+        if success and expected is not None:
+            self.memory.associate(observed, expected, weight=reward)
+            self.memory.refresh(observed, boost=reward)
+```
